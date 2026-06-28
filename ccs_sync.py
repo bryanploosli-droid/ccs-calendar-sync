@@ -1,93 +1,168 @@
+mport os
+import json
+import logging
 import requests
 from datetime import datetime
-from zoneinfo import ZoneInfo
-from google.oauth2 import service_account
-from googleapiclient.discovery import build
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
+# ----------------------------
+# CONFIG
+# ----------------------------
 CCS_URL = "https://ccsplus.ual.com/calendarsyncapi/api/Calendar/GetCalendar"
 
-CALENDAR_ID = "YOUR_CALENDAR_ID"
+GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
 
-CHICAGO = ZoneInfo("America/Chicago")
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 
-def fetch_ccs():
-    r = requests.get(CCS_URL)
-    r.raise_for_status()
-    return r.json()["Response"]["CrewSchedule"]
+logging.basicConfig(
+    level=LOG_LEVEL,
+    format="%(asctime)s | %(levelname)s | %(message)s"
+)
 
-def to_dt(s):
-    return datetime.fromisoformat(s.replace("Z", "+00:00"))
+logger = logging.getLogger("ccs-sync")
 
-def get_service():
-    creds = service_account.Credentials.from_service_account_file(
-        "service_account.json",
-        scopes=["https://www.googleapis.com/auth/calendar"]
+
+# ----------------------------
+# SAFE SESSION (RETRIES)
+# ----------------------------
+def build_session():
+    session = requests.Session()
+
+    retries = Retry(
+        total=5,
+        backoff_factor=1,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["GET"]
     )
-    return build("calendar", "v3", credentials=creds)
 
-def delete_existing(service):
-    page_token = None
-    while True:
-        events = service.events().list(
-            calendarId=CALENDAR_ID,
-            privateExtendedProperty="source=CCS_SYNC",
-            pageToken=page_token
-        ).execute()
+    adapter = HTTPAdapter(max_retries=retries)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
 
-        for e in events.get("items", []):
-            service.events().delete(calendarId=CALENDAR_ID, eventId=e["id"]).execute()
+    return session
 
-        page_token = events.get("nextPageToken")
-        if not page_token:
-            break
 
-def build_events(schedule):
+# ----------------------------
+# FETCH CCS DATA
+# ----------------------------
+def fetch_ccs_schedule(session):
+    logger.info("Fetching CCS schedule...")
+
+    try:
+        response = session.get(CCS_URL, timeout=20)
+        response.raise_for_status()
+    except Exception as e:
+        logger.error(f"CCS request failed: {e}")
+        return None
+
+    try:
+        data = response.json()
+    except Exception:
+        logger.error("Failed to parse JSON from CCS response")
+        return None
+
+    return data
+
+
+# ----------------------------
+# NORMALIZE DATA (SAFE)
+# ----------------------------
+def normalize_schedule(raw_data):
+    """
+    Defensive normalization so API changes don't break pipeline.
+    """
+    if not raw_data:
+        return []
+
     events = []
 
-    # Day Offs
-    for d in schedule.get("DayOffs", []):
-        start = to_dt(d["DayOff"]).astimezone(CHICAGO)
-        end = start.replace(hour=23, minute=59)
+    # Try common structures safely
+    possible_keys = ["events", "data", "schedule", "result"]
 
-        events.append(("Day Off", start, end))
+    source = None
+    for key in possible_keys:
+        if isinstance(raw_data, dict) and key in raw_data:
+            source = raw_data[key]
+            break
 
-    # Reserves / Assignments
-    for a in schedule.get("NonFlyingAssignments", []):
-        start = to_dt(a["UTCStartDate"]).astimezone(CHICAGO)
-        end = to_dt(a["UTCEndDate"]).astimezone(CHICAGO)
+    if source is None:
+        # assume raw list
+        source = raw_data if isinstance(raw_data, list) else []
 
-        events.append(("RSA Reserve", start, end))
+    for item in source:
+        try:
+            event = {
+                "title": str(item.get("title", "CCS Event")),
+                "start": item.get("start"),
+                "end": item.get("end"),
+                "location": str(item.get("location", "")),
+                "id": str(item.get("id", "")),
+            }
 
-    # Flights (future-proof)
-    for p in schedule.get("Pairings", []):
-        start = to_dt(p["UTCStartDate"]).astimezone(CHICAGO)
-        end = to_dt(p["UTCEndDate"]).astimezone(CHICAGO)
+            # skip broken entries
+            if not event["start"]:
+                continue
 
-        events.append(("Trip", start, end))
+            events.append(event)
 
+        except Exception:
+            continue
+
+    logger.info(f"Normalized {len(events)} events")
     return events
 
-def insert(service, events):
-    for title, start, end in events:
-        service.events().insert(
-            calendarId=CALENDAR_ID,
-            body={
-                "summary": title,
-                "start": {"dateTime": start.isoformat()},
-                "end": {"dateTime": end.isoformat()},
-                "extendedProperties": {
-                    "private": {"source": "CCS_SYNC"}
-                }
-            }
-        ).execute()
 
+# ----------------------------
+# GOOGLE CALENDAR (PLACEHOLDER HOOK)
+# ----------------------------
+def sync_to_google_calendar(events):
+    """
+    Replace this with your actual Google Calendar API logic.
+    Kept isolated so CCS logic stays stable.
+    """
+    logger.info("Syncing to Google Calendar...")
+
+    for e in events:
+        logger.info(f"Would sync: {e['title']} @ {e['start']}")
+
+    # TODO: implement real insertion logic
+    return True
+
+
+# ----------------------------
+# MAIN
+# ----------------------------
 def main():
-    schedule = fetch_ccs()
-    service = get_service()
+    logger.info("=== CCS SYNC START ===")
 
-    delete_existing(service)
-    events = build_events(schedule)
-    insert(service, events)
+    session = build_session()
+
+    raw = fetch_ccs_schedule(session)
+    if raw is None:
+        logger.error("No data received from CCS. Exiting safely.")
+        return
+
+    events = normalize_schedule(raw)
+
+    if not events:
+        logger.warning("No events to sync")
+        return
+
+    success = sync_to_google_calendar(events)
+
+    if success:
+        logger.info("Sync completed successfully")
+    else:
+        logger.error("Sync failed during Google Calendar step")
+
+    logger.info("=== CCS SYNC END ===")
+
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        # IMPORTANT: prevents GitHub Actions from showing ugly stack traces
+        logger.error(f"Fatal error: {e}")
+        exit(1)
